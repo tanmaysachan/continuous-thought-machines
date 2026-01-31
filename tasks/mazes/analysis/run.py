@@ -14,7 +14,8 @@ import imageio # Used for saving GIFs in viz
 # Local imports
 from data.custom_datasets import MazeImageFolder
 from models.ctm import ContinuousThoughtMachine
-from tasks.mazes.plotting import draw_path # 
+from models.ctm_hebbian import wrap_ctm_with_hebbian
+from tasks.mazes.plotting import draw_path #
 from tasks.image_classification.plotting import save_frames_to_mp4
 
 def has_solved_checker(x_maze, route, valid_only=True, fault_tolerance=1, exclusions=[]):
@@ -89,30 +90,22 @@ def parse_args():
     parser.add_argument('--batch_size_test', type=int, default=32, help="Batch size for loading test data for 'viz'")
     parser.add_argument('--max_reapplications', type=int, default=20, help="When testing generalisation to extra large mazes")
     parser.add_argument('--legacy_scaling', action=argparse.BooleanOptionalAction, default=True, help='Legacy checkpoints scale between 0 and 1, new ones can scale -1 to 1.')
+    parser.add_argument('--save_failed', action=argparse.BooleanOptionalAction, default=False, help='Save visuals even for failed mazes.')
     return parser.parse_args()
 
-def _load_ctm_model(checkpoint_path, device):
-    """Loads the ContinuousThoughtMachine model from a checkpoint."""
-    print(f"Loading checkpoint: {checkpoint_path}")
-    checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
-    model_args = checkpoint['args']
-
-    # Handle legacy arguments for model_args
+def _create_base_ctm(model_args, device):
+    """Creates a base ContinuousThoughtMachine from model args."""
+    # Handle legacy arguments
     if not hasattr(model_args, 'backbone_type') and hasattr(model_args, 'resnet_type'):
         model_args.backbone_type = f'{model_args.resnet_type}-{getattr(model_args, "resnet_feature_scales", [4])[-1]}'
-    
-    # Ensure prediction_reshaper is derived correctly
-    # Assuming out_dims exists and is used for this
-    prediction_reshaper = [model_args.out_dims // 5, 5] if hasattr(model_args, 'out_dims') else None
-
-
     if not hasattr(model_args, 'neuron_select_type'):
         model_args.neuron_select_type = 'first-last'
     if not hasattr(model_args, 'n_random_pairing_self'):
         model_args.n_random_pairing_self = 0
 
-    print("Instantiating CTM model...")
-    model = ContinuousThoughtMachine(
+    prediction_reshaper = [model_args.out_dims // 5, 5] if hasattr(model_args, 'out_dims') else None
+
+    return ContinuousThoughtMachine(
         iterations=model_args.iterations,
         d_model=model_args.d_model,
         d_input=model_args.d_input,
@@ -121,19 +114,53 @@ def _load_ctm_model(checkpoint_path, device):
         n_synch_action=model_args.n_synch_action,
         synapse_depth=model_args.synapse_depth,
         memory_length=model_args.memory_length,
-        deep_nlms=model_args.deep_memory, # Mapping from model_args.deep_memory
+        deep_nlms=model_args.deep_memory,
         memory_hidden_dims=model_args.memory_hidden_dims,
-        do_layernorm_nlm=model_args.do_normalisation, # Mapping from model_args.do_normalisation
+        do_layernorm_nlm=model_args.do_normalisation,
         backbone_type=model_args.backbone_type,
         positional_embedding_type=model_args.positional_embedding_type,
         out_dims=model_args.out_dims,
         prediction_reshaper=prediction_reshaper,
-        dropout=0, # Explicitly setting dropout to 0 as in original
+        dropout=0,
         neuron_select_type=model_args.neuron_select_type,
         n_random_pairing_self=model_args.n_random_pairing_self,
+    )
+
+
+def _wrap_with_hebbian(base_ctm, model_args, device):
+    """Wraps a base CTM with Hebbian lateral connections."""
+    print(f"Wrapping with Hebbian (lr={model_args.hebbian_lr}, decay={model_args.hebbian_decay}, "
+          f"strength={model_args.lateral_strength}, injection={model_args.lateral_injection})")
+    return wrap_ctm_with_hebbian(
+        base_ctm,
+        hebbian_lr=getattr(model_args, 'hebbian_lr', 0.0001),
+        hebbian_decay=getattr(model_args, 'hebbian_decay', 0.999),
+        use_oja=getattr(model_args, 'use_oja', False),
+        lateral_strength=getattr(model_args, 'lateral_strength', 0.1),
+        lateral_injection=getattr(model_args, 'lateral_injection', 'pre_synapse'),
     ).to(device)
 
-    load_result = model.load_state_dict(checkpoint['state_dict'], strict=False)
+
+def _load_ctm_model(checkpoint_path, device):
+    """Loads CTM or HebbianCTM model from a checkpoint."""
+    print(f"Loading checkpoint: {checkpoint_path}")
+    checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
+    model_args = checkpoint['args']
+
+    # Create base CTM
+    print("Instantiating CTM model...")
+    base_ctm = _create_base_ctm(model_args, device)
+
+    # Wrap with Hebbian if checkpoint was trained with it
+    use_hebbian = getattr(model_args, 'use_hebbian', False)
+    if use_hebbian:
+        model = _wrap_with_hebbian(base_ctm, model_args, device)
+    else:
+        model = base_ctm.to(device)
+
+    # Load weights
+    state_dict_key = 'model_state_dict' if 'model_state_dict' in checkpoint else 'state_dict'
+    load_result = model.load_state_dict(checkpoint[state_dict_key], strict=False)
     print(f"Loaded state_dict. Missing keys: {load_result.missing_keys}, Unexpected keys: {load_result.unexpected_keys}")
     model.eval()
     return model
@@ -144,6 +171,8 @@ if __name__=='__main__':
 
     if args.device[0] != -1 and torch.cuda.is_available():
         device = f'cuda:{args.device[0]}'
+    elif torch.backends.mps.is_available():
+        device = 'mps'
     else:
         device = 'cpu'
     print(f"Using device: {device}")
@@ -205,12 +234,15 @@ if __name__=='__main__':
                 with torch.no_grad():
                      predictions, certainties, _, _, _, attention_tracking = model(current_input_maze, track=True)
 
-                h_feat, w_feat = model.kv_features.shape[-2:]
+                base_model = model.ctm if hasattr(model, 'ctm') else model
+                h_feat, w_feat = base_model.kv_features.shape[-2:]
                 attention_tracking = attention_tracking.reshape(attention_tracking.shape[0], -1, h_feat, w_feat) 
 
                 n_steps_viz = predictions.shape[-1] # Use a different name to avoid conflict if n_steps is used elsewhere
                 step_linspace = np.linspace(0, 1, n_steps_viz)
-                current_maze_np = current_input_maze[0].permute(1,2,0).detach().cpu().numpy()
+                current_maze_np_raw = current_input_maze[0].permute(1,2,0).detach().cpu().numpy()
+                # Rescale from [-1, 1] to [0, 1] if not using legacy scaling
+                current_maze_np = (current_maze_np_raw + 1) / 2 if not args.legacy_scaling else current_maze_np_raw
 
                 for stepi in range(n_steps_viz):
                     pred_route = predictions[0, :, stepi].reshape(-1, 5).argmax(-1).detach().cpu().numpy()
@@ -255,10 +287,12 @@ if __name__=='__main__':
                 
                 next_input = current_input_maze.clone()
                 old_start_idx = tuple(current_start_loc_list[0])
-                next_input[0, :, old_start_idx[0], old_start_idx[1]] = 1.0 # Reset old start to path
-                
+                next_input[0, :, old_start_idx[0], old_start_idx[1]] = 1.0 # Reset old start to path (white)
+
                 if 0 <= final_pos[0] < next_input.shape[2] and 0 <= final_pos[1] < next_input.shape[3]:
-                    next_input[0, :, final_pos[0], final_pos[1]] = torch.tensor([1,0,0], device=device, dtype=next_input.dtype) # New start
+                    # New start: [1,0,0] in [0,1] range, or [1,-1,-1] in [-1,1] range
+                    new_start_color = torch.tensor([1,0,0], device=device, dtype=next_input.dtype) if args.legacy_scaling else torch.tensor([1,-1,-1], device=device, dtype=next_input.dtype)
+                    next_input[0, :, final_pos[0], final_pos[1]] = new_start_color
                 else:
                     print(f"Warning: final_pos {final_pos} out of bounds for maze {maze_idx_display}. Stopping reapplication.")
                     break 
@@ -267,12 +301,19 @@ if __name__=='__main__':
             if has_solved:
                 print(f'Solved maze of length {maze_actual_length}! Saving...')
                 os.makedirs(maze_output_dir, exist_ok=True)
-                if ongoing_solution_img is not None: 
+                if ongoing_solution_img is not None:
                     cv2.imwrite(os.path.join(maze_output_dir, 'ongoing_solution.png'), (ongoing_solution_img * 255).astype(np.uint8)[:,:,::-1])
-                if long_frames: 
+                if long_frames:
                     save_frames_to_mp4([fm[:,:,::-1] for fm in long_frames], os.path.join(maze_output_dir, f'combined_process.mp4'), fps=45, gop_size=10, preset='veryslow', crf=20)
             else:
-                print(f'Failed maze of length {maze_actual_length} after {re_applications} reapplications. Not saving visuals for this maze.')
+                print(f'Failed maze of length {maze_actual_length} after {re_applications} reapplications.')
+                if args.save_failed:
+                    print(f'Saving visuals for failed maze (--save_failed enabled)...')
+                    os.makedirs(maze_output_dir, exist_ok=True)
+                    if ongoing_solution_img is not None:
+                        cv2.imwrite(os.path.join(maze_output_dir, 'ongoing_solution_FAILED.png'), (ongoing_solution_img * 255).astype(np.uint8)[:,:,::-1])
+                    if long_frames:
+                        save_frames_to_mp4([fm[:,:,::-1] for fm in long_frames], os.path.join(maze_output_dir, f'combined_process_FAILED.mp4'), fps=45, gop_size=10, preset='veryslow', crf=20)
 
             if maze_actual_length not in results: results[maze_actual_length] = []
             results[maze_actual_length].append((has_solved, re_applications))
@@ -344,16 +385,17 @@ if __name__=='__main__':
 
         with torch.no_grad():
             predictions, _, _, _, _, attention_tracking = model(inputs_viz, track=True)
-        
-        # Reshape attention: (Steps, Batch, Heads, H_feat, W_feat) assuming model.kv_features has H_feat, W_feat
-        # The original reshape was slightly different, this tries to match the likely intended dimensions for per-step, per-batch item attention
-        if attention_tracking is not None and hasattr(model, 'kv_features') and model.kv_features is not None:
+
+        # Reshape attention: (Steps, Batch, Heads, H_feat, W_feat)
+        # Handle both base CTM and HebbianCTM wrapper
+        base_model = model.ctm if hasattr(model, 'ctm') else model
+        if attention_tracking is not None and hasattr(base_model, 'kv_features') and base_model.kv_features is not None:
              attention_tracking = attention_tracking.reshape(
                  attention_tracking.shape[0], # Iterations/Steps
                  inputs_viz.size(0), # Batch size (num_viz_mazes)
                  -1, # Heads (inferred)
-                 model.kv_features.shape[-2], # H_feat
-                 model.kv_features.shape[-1]  # W_feat
+                 base_model.kv_features.shape[-2], # H_feat
+                 base_model.kv_features.shape[-1]  # W_feat
             )
         else:
             attention_tracking = None # Ensure it's None if it can't be reshaped

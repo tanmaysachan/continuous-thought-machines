@@ -1,0 +1,38 @@
+#!/bin/bash
+# STDP CTM training on mazes-small dataset for Mac (Apple Silicon)
+# Uses Spike-Timing Dependent Plasticity (causal Hebbian learning)
+# where connections strengthen when pre(t-1) -> post(t)
+#
+# Key difference from Hebbian:
+# - Hebbian: neurons that fire together wire together (symmetric)
+# - STDP: neurons that fire in sequence wire together (asymmetric)
+
+python -m tasks.mazes.train \
+    --dataset mazes-small \
+    --maze_route_length 50 \
+    --cirriculum_lookahead 5 \
+    --model ctm \
+    --d_model 1024 \
+    --d_input 256 \
+    --backbone_type resnet18-1 \
+    --synapse_depth 8 \
+    --heads 4 \
+    --n_synch_out 128 \
+    --n_synch_action 128 \
+    --neuron_select_type random-pairing \
+    --memory_length 25 \
+    --iterations 50 \
+    --training_iterations 100001 \
+    --lr 1e-4 \
+    --batch_size 64 \
+    --batch_size_test 32 \
+    --n_test_batches 50 \
+    --log_dir logs/stdp/mazes-small-mac \
+    --track_every 2000 \
+    --save_every 1000 \
+    --keep_checkpoint_history \
+    --use_stdp \
+    --stdp_lr 0.0001 \
+    --stdp_decay 0.999 \
+    --lateral_strength 0.1 \
+    --lateral_injection pre_synapse

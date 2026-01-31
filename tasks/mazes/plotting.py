@@ -179,7 +179,10 @@ def make_maze_gif(inputs, predictions, targets, attention_tracking, save_locatio
             canvas = fig.canvas
             canvas.draw()
             image_numpy = np.frombuffer(canvas.buffer_rgba(), dtype='uint8')
-            image_numpy = image_numpy.reshape(*reversed(canvas.get_width_height()), 4)[:,:,:3] # Get RGB
+            # Get actual renderer dimensions (handles Retina/HiDPI displays)
+            renderer = canvas.get_renderer()
+            width, height = int(renderer.width), int(renderer.height)
+            image_numpy = image_numpy.reshape(height, width, 4)[:,:,:3] # Get RGB
 
             frames.append(image_numpy) # Add to list for GIF
 

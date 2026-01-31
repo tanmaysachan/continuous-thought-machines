@@ -14,6 +14,8 @@ from tqdm.auto import tqdm
 
 from data.custom_datasets import MazeImageFolder
 from models.ctm import ContinuousThoughtMachine
+from models.ctm_hebbian import wrap_ctm_with_hebbian
+from models.ctm_stdp import wrap_ctm_with_stdp
 from models.lstm import LSTMBaseline
 from models.ff import FFBaseline
 from tasks.mazes.plotting import make_maze_gif
@@ -81,6 +83,17 @@ def parse_args():
     parser.add_argument('--memory_hidden_dims', type=int, default=32, help='Hidden dimensions of the memory if using deep memory (CTM only).') # Default changed
     parser.add_argument('--dropout_nlm', type=float, default=None, help='Dropout rate for NLMs specifically. Unset to match dropout on the rest of the model (CTM only).')
     parser.add_argument('--do_normalisation', action=argparse.BooleanOptionalAction, default=False, help='Apply normalization in NLMs (CTM only).')
+    # Hebbian lateral connections (CTM only)
+    parser.add_argument('--use_hebbian', action=argparse.BooleanOptionalAction, default=False, help='Wrap CTM with Hebbian lateral connections (CTM only).')
+    parser.add_argument('--hebbian_lr', type=float, default=0.0001, help='Learning rate for Hebbian weight updates (CTM only).')
+    parser.add_argument('--hebbian_decay', type=float, default=0.999, help='Decay factor for Hebbian weights (CTM only).')
+    parser.add_argument('--use_oja', action=argparse.BooleanOptionalAction, default=False, help='Use Oja\'s normalized Hebbian rule (CTM only).')
+    parser.add_argument('--lateral_strength', type=float, default=0.1, help='Scaling factor for lateral input contribution (CTM only).')
+    parser.add_argument('--lateral_injection', type=str, default='pre_synapse', choices=['pre_synapse', 'post_nlm', 'both'], help='Where to inject lateral input (CTM only).')
+    # STDP lateral connections (CTM only)
+    parser.add_argument('--use_stdp', action=argparse.BooleanOptionalAction, default=False, help='Wrap CTM with STDP lateral connections (CTM only).')
+    parser.add_argument('--stdp_lr', type=float, default=0.0001, help='Learning rate for STDP weight updates (CTM only).')
+    parser.add_argument('--stdp_decay', type=float, default=0.999, help='Decay factor for STDP weights (CTM only).')
     # LSTM specific
     parser.add_argument('--num_layers', type=int, default=2, help='Number of LSTM stacked layers (LSTM only).') # Added LSTM arg
 
@@ -112,6 +125,7 @@ def parse_args():
     parser.add_argument('--data_root', type=str, default='data/mazes', help='Data root.')
     
     parser.add_argument('--save_every', type=int, default=1000, help='Save checkpoints every this many iterations.')
+    parser.add_argument('--keep_checkpoint_history', action=argparse.BooleanOptionalAction, default=False, help='Save checkpoints with step number appended (checkpoint_<step>.pt) in addition to checkpoint.pt.')
     parser.add_argument('--seed', type=int, default=412, help='Random seed.')
     parser.add_argument('--reload', action=argparse.BooleanOptionalAction, default=False, help='Reload from disk?')
     parser.add_argument('--reload_model_only', action=argparse.BooleanOptionalAction, default=False, help='Reload only the model from disk?')
@@ -164,7 +178,7 @@ if __name__=='__main__':
     # Build model conditionally
     model = None
     if args.model == 'ctm':
-        model = ContinuousThoughtMachine(
+        base_ctm = ContinuousThoughtMachine(
             iterations=args.iterations,
             d_model=args.d_model,
             d_input=args.d_input,
@@ -179,12 +193,34 @@ if __name__=='__main__':
             backbone_type=args.backbone_type,
             positional_embedding_type=args.positional_embedding_type,
             out_dims=args.out_dims,
-            prediction_reshaper=prediction_reshaper, 
+            prediction_reshaper=prediction_reshaper,
             dropout=args.dropout,
             dropout_nlm=args.dropout_nlm,
             neuron_select_type=args.neuron_select_type,
             n_random_pairing_self=args.n_random_pairing_self,
-        ).to(device)
+        )
+        # Optionally wrap with Hebbian or STDP lateral connections
+        if args.use_hebbian:
+            model = wrap_ctm_with_hebbian(
+                base_ctm,
+                hebbian_lr=args.hebbian_lr,
+                hebbian_decay=args.hebbian_decay,
+                use_oja=args.use_oja,
+                lateral_strength=args.lateral_strength,
+                lateral_injection=args.lateral_injection,
+            ).to(device)
+            print(f'Using Hebbian CTM: lr={args.hebbian_lr}, decay={args.hebbian_decay}, strength={args.lateral_strength}')
+        elif args.use_stdp:
+            model = wrap_ctm_with_stdp(
+                base_ctm,
+                stdp_lr=args.stdp_lr,
+                stdp_decay=args.stdp_decay,
+                lateral_strength=args.lateral_strength,
+                lateral_injection=args.lateral_injection,
+            ).to(device)
+            print(f'Using STDP CTM: lr={args.stdp_lr}, decay={args.stdp_decay}, strength={args.lateral_strength}')
+        else:
+            model = base_ctm.to(device)
     elif args.model == 'lstm':
          model = LSTMBaseline(
             num_layers=args.num_layers,
@@ -439,6 +475,12 @@ if __name__=='__main__':
             if isinstance(upto_where, (np.ndarray, list)) and len(upto_where) > 0:
                  pbar_desc += f' Path pred stats: {upto_where_mean:0.2f}+-{upto_where_std:0.2f} ({upto_where_min:d} --> {upto_where_max:d})'
 
+            # Add Hebbian stats if using Hebbian CTM
+            if args.use_hebbian and hasattr(model, 'hebbian'):
+                hebb_max = model.hebbian.hebbian_weights.abs().max().item()
+                gate_mean = torch.sigmoid(model.hebbian.lateral_gate_weights).mean().item()
+                pbar_desc += f' HebbMax={hebb_max:.4f} Gate={gate_mean:.3f}'
+
             pbar.set_description(f'Dataset={args.dataset}. Model={args.model}. {pbar_desc}')
 
 
@@ -653,7 +695,9 @@ if __name__=='__main__':
                             # Reshape predictions (assuming raw is B, D, T)
                             predictions_viz = predictions_viz_raw.reshape(predictions_viz_raw.size(0), -1, 5, predictions_viz_raw.size(-1)) # B, S, C, T
 
-                            att_shape = (model.kv_features.shape[2], model.kv_features.shape[3])
+                            # Handle both base CTM and HebbianCTM wrapper
+                            base_model = model.ctm if hasattr(model, 'ctm') else model
+                            att_shape = (base_model.kv_features.shape[2], base_model.kv_features.shape[3])
                             attention_tracking_viz = attention_tracking_viz.reshape(
                                 attention_tracking_viz.shape[0], 
                                 attention_tracking_viz.shape[1], -1, att_shape[0], att_shape[1])
@@ -700,5 +744,7 @@ if __name__=='__main__':
                     'random_rng_state': random.getstate(),
                 }
                 torch.save(checkpoint_data, f'{args.log_dir}/checkpoint.pt')
+                if args.keep_checkpoint_history:
+                    torch.save(checkpoint_data, f'{args.log_dir}/checkpoint_{bi}.pt')
 
             pbar.update(1)
